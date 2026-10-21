@@ -443,32 +443,56 @@ def force_synthid_tokens(
     candidate_cap: int | None = None,
     max_probability: float = 1.0,
 ) -> torch.Tensor:
-    rows = eligible.nonzero(as_tuple=True)[0]
-    if rows.numel() == 0:
-        return eligible
+    # Sync-free: computes every row and masks on GPU, because nonzero() /
+    # bool-mask indexing would stall the overlap scheduler each decode step.
     probabilities = _truncate_probabilities(
-        logits[rows],
-        temperatures[rows],
-        top_ks[rows],
-        top_ps[rows],
-        min_ps[rows],
+        logits, temperatures, top_ks, top_ps, min_ps
     )
-    keep = probabilities.amax(dim=-1) <= max_probability
-    rows = rows[keep]
-    selected_mask = torch.zeros_like(eligible)
-    if rows.numel() == 0:
-        return selected_mask
-    selected_mask[rows] = True
+    if max_probability < 1.0:
+        eligible = eligible & (probabilities.amax(dim=-1) <= max_probability)
     selected = select_synthid_tokens_torch(
-        probabilities[keep].to(torch.float32),
-        context_hashes[rows],
-        keys[rows],
+        probabilities.to(torch.float32),
+        context_hashes,
+        keys,
         depth,
         candidate_cap=candidate_cap,
     )
-    logits[rows] = -torch.inf
-    logits[rows, selected] = 0.0
-    return selected_mask
+    forced = torch.full_like(logits, -torch.inf)
+    forced.scatter_(dim=-1, index=selected.unsqueeze(-1), value=0.0)
+    logits.copy_(torch.where(eligible.unsqueeze(-1), forced, logits))
+    return eligible
+
+
+def _synthid_layer_g_values_torch(
+    keys: torch.Tensor,
+    context_hashes: torch.Tensor,
+    token_ids: torch.Tensor,
+    depth: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """All SynthID g-value layers at once, [rows, depth, C].
+
+    Bit-identical to stacking _watermark_hash32_layer_torch over layers
+    0..depth-1: the first three murmur3 mixes are per-row, so they run once
+    and only the token/layer mixes broadcast over [rows, depth, C].
+    """
+    token_matrix = (
+        token_ids.view(1, 1, -1) if token_ids.dim() == 1 else token_ids.unsqueeze(1)
+    )
+    rows = keys.shape[0]
+    row_state = torch.zeros(rows, dtype=torch.int64, device=keys.device)
+    row_state = _murmur3_mix(row_state, keys & _MASK32)
+    row_state = _murmur3_mix(row_state, (keys >> 32) & _MASK32)
+    row_state = _murmur3_mix(row_state, context_hashes & _MASK32)
+    state = _murmur3_mix(row_state.view(rows, 1, 1), token_matrix & _MASK32)
+    layers = torch.arange(1, depth + 1, dtype=torch.int64, device=keys.device)
+    state = _murmur3_mix(state, layers.view(1, depth, 1))
+    return (_fmix32(state ^ 20) >= (1 << 31)).to(dtype)
+
+
+# Largest intermediate in the vectorized path is [rows, depth, C] int64;
+# bigger shapes fall back to the per-layer loop.
+_SYNTHID_VECTORIZED_G_BUDGET_BYTES = 256 << 20
 
 
 def _synthid_reweight_probs(
@@ -499,9 +523,22 @@ def _synthid_reweight_probs(
         if candidate_ids is None
         else candidate_ids
     )
+    if keys.shape[0] * depth * token_ids.shape[-1] * 8 <= (
+        _SYNTHID_VECTORIZED_G_BUDGET_BYTES
+    ):
+        g_layers = _synthid_layer_g_values_torch(
+            keys, context_hashes, token_ids, depth, probs.dtype
+        ).unbind(dim=1)
+    else:
+        g_layers = None
     for layer in range(depth):
-        hashed = _watermark_hash32_layer_torch(keys, context_hashes, token_ids, layer)
-        g = (hashed >= (1 << 31)).to(probs.dtype)
+        if g_layers is not None:
+            g = g_layers[layer]
+        else:
+            hashed = _watermark_hash32_layer_torch(
+                keys, context_hashes, token_ids, layer
+            )
+            g = (hashed >= (1 << 31)).to(probs.dtype)
         g_mass = (g * probs).sum(dim=-1, keepdim=True)
         if tail_mass is not None:
             g_mass = g_mass + 0.5 * tail_mass
@@ -551,7 +588,7 @@ def _truncate_probabilities(
     top_ps: torch.Tensor,
     min_ps: torch.Tensor,
 ) -> torch.Tensor:
-    probabilities = torch.softmax(logits / temperatures, dim=-1)
+    probabilities = torch.softmax(logits / temperatures.view(-1, 1), dim=-1)
     sorted_probabilities, sorted_indices = probabilities.sort(dim=-1, descending=True)
     cumulative_probabilities = torch.cumsum(sorted_probabilities, dim=-1)
     ranks = torch.arange(logits.shape[-1], device=logits.device).view(1, -1)
@@ -990,21 +1027,22 @@ class WatermarkState:
         context_hashes: torch.Tensor,
         selected: torch.Tensor,
     ) -> None:
-        rows = selected.nonzero(as_tuple=True)[0]
-        if rows.numel() == 0:
-            return
-        pool_indices = req_pool_indices[rows].to(torch.int64)
+        # Sync-free: writes back old values for ineligible rows instead of
+        # compacting with nonzero(); one row per request in decode, so the
+        # scatter indices are unique.
+        pool_indices = req_pool_indices.to(torch.int64)
         counts = self.num_watermarked_contexts[pool_indices]
-        within_capacity = counts < self.watermarked_context_hashes.shape[1]
-        rows = rows[within_capacity]
-        pool_indices = pool_indices[within_capacity]
-        counts = counts[within_capacity]
-        if rows.numel() == 0:
-            return
-        self.watermarked_context_hashes[pool_indices, counts.to(torch.int64)] = (
-            context_hashes[rows].to(torch.int32)
+        within_capacity = selected & (counts < self.watermarked_context_hashes.shape[1])
+        slots = counts.clamp_max(self.watermarked_context_hashes.shape[1] - 1).to(
+            torch.int64
         )
-        self.num_watermarked_contexts[pool_indices] = counts + 1
+        old_values = self.watermarked_context_hashes[pool_indices, slots]
+        self.watermarked_context_hashes[pool_indices, slots] = torch.where(
+            within_capacity, context_hashes.to(torch.int32), old_values
+        )
+        self.num_watermarked_contexts[pool_indices] = counts + within_capacity.to(
+            counts.dtype
+        )
 
     def speculative_contexts(
         self,
