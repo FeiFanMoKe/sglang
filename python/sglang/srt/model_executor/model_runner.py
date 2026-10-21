@@ -638,6 +638,7 @@ class ModelRunner:
                 algorithm=features.watermark_algorithm,
                 synthid_depth=features.watermark_synthid_depth,
                 synthid_candidate_cap=features.watermark_synthid_candidate_cap,
+                synthid_compile=features.watermark_synthid_compile,
             )
             if features.enable_watermark and not self.is_draft_worker
             else None

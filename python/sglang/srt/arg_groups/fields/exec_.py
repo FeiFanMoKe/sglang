@@ -119,6 +119,10 @@ class ExecFeatures(msgspec.Struct):
         Optional[int],
         Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
     ] = 4096
+    watermark_synthid_compile: A[
+        bool,
+        Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
+    ] = False
     enable_return_hidden_states: A[
         bool,
         "Enable returning full hidden states with responses. Equivalent to "

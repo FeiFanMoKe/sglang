@@ -34,6 +34,7 @@ class WatermarkServerConfig(msgspec.Struct, frozen=True, kw_only=True):
     algorithm: str | None = None
     synthid_depth: int | None = None
     synthid_candidate_cap: int | None = None
+    synthid_compile: bool | None = None
 
     def __repr__(self) -> str:
         return (
@@ -45,7 +46,8 @@ class WatermarkServerConfig(msgspec.Struct, frozen=True, kw_only=True):
             f"enforce_all={self.enforce_all!r}, "
             f"algorithm={self.algorithm!r}, "
             f"synthid_depth={self.synthid_depth!r}, "
-            f"synthid_candidate_cap={self.synthid_candidate_cap!r})"
+            f"synthid_candidate_cap={self.synthid_candidate_cap!r}, "
+            f"synthid_compile={self.synthid_compile!r})"
         )
 
 
@@ -119,7 +121,7 @@ def load_watermark_config(source: str) -> WatermarkServerConfig:
             isinstance(value, bool) or not isinstance(value, (int, float))
         ):
             raise WatermarkConfigError(f"watermark config {name} must be a number")
-    for name in ("default_enabled", "enforce_all"):
+    for name in ("default_enabled", "enforce_all", "synthid_compile"):
         if raw.get(name) is not None and not isinstance(raw[name], bool):
             raise WatermarkConfigError(f"watermark config {name} must be a boolean")
     algorithm = raw.get("algorithm")

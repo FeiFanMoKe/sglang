@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import logging
 from typing import TYPE_CHECKING, Any, Optional, Sequence
 
 import msgspec
 import torch
+
+logger = logging.getLogger(__name__)
 
 from .config import (
     MAX_SYNTHID_DEPTH,
@@ -442,6 +445,7 @@ def force_synthid_tokens(
     depth: int,
     candidate_cap: int | None = None,
     max_probability: float = 1.0,
+    reweight_fn=None,
 ) -> torch.Tensor:
     # Sync-free: computes every row and masks on GPU, because nonzero() /
     # bool-mask indexing would stall the overlap scheduler each decode step.
@@ -456,6 +460,7 @@ def force_synthid_tokens(
         keys,
         depth,
         candidate_cap=candidate_cap,
+        reweight_fn=reweight_fn,
     )
     forced = torch.full_like(logits, -torch.inf)
     forced.scatter_(dim=-1, index=selected.unsqueeze(-1), value=0.0)
@@ -555,12 +560,27 @@ def _synthid_reweight_probs(
     return (probabilities * tail_scale).scatter(-1, candidate_ids, probs)
 
 
+_compiled_synthid_reweight = None
+
+
+def _get_compiled_synthid_reweight():
+    # Compiled kernels reorder fp32 reductions, so output tokens are not
+    # bit-identical to eager; the distribution and detector are unaffected.
+    global _compiled_synthid_reweight
+    if _compiled_synthid_reweight is None:
+        _compiled_synthid_reweight = torch.compile(
+            _synthid_reweight_probs, dynamic=True
+        )
+    return _compiled_synthid_reweight
+
+
 def select_synthid_tokens_torch(
     probabilities: torch.Tensor,
     context_hashes: torch.Tensor,
     keys: torch.Tensor,
     depth: int,
     candidate_cap: int | None = None,
+    reweight_fn=None,
 ) -> torch.Tensor:
     """Non-distortionary SynthID-Text selection.
 
@@ -568,7 +588,7 @@ def select_synthid_tokens_torch(
     then draws with a keyed inverse-CDF step: deterministic per
     (key, context), no global RNG consumption.
     """
-    probs = _synthid_reweight_probs(
+    probs = (reweight_fn or _synthid_reweight_probs)(
         probabilities, context_hashes, keys, depth, candidate_cap
     )
     uniforms = _watermark_sample_uniform_torch(keys, context_hashes)
@@ -680,6 +700,7 @@ class WatermarkState:
         algorithm: str = "gumbel",
         synthid_depth: int = 30,
         synthid_candidate_cap: int | None = 4096,
+        synthid_compile: bool = False,
     ) -> None:
         if algorithm not in WATERMARK_ALGORITHMS:
             raise ValueError(
@@ -694,6 +715,11 @@ class WatermarkState:
         self.algorithm = algorithm
         self.synthid_depth = synthid_depth
         self.synthid_candidate_cap = synthid_candidate_cap
+        self._reweight_fn = _synthid_reweight_probs
+        if synthid_compile and algorithm == "synthid":
+            self._reweight_fn = self._compile_reweight_with_fallback(
+                device, vocab_size
+            )
         self.default_key_source = key
         self.default_key = parse_watermark_key(key) if key is not None else None
         self.default_key_b = parse_watermark_key(key_b) if key_b is not None else None
@@ -1342,6 +1368,77 @@ class WatermarkState:
             valid = position < accept_lens
             self.append(req_pool_indices[valid], accept_tokens[valid, position])
 
+    def _compile_reweight_with_fallback(self, device: str, vocab_size: int):
+        """Compile the reweight and warm it up at startup, not first request."""
+        vocab = max(vocab_size, (self.synthid_candidate_cap or 0) + 1, 1024)
+        try:
+            compiled = _get_compiled_synthid_reweight()
+            for rows in (1, 2):
+                probs = torch.full((rows, vocab), 1.0 / vocab, device=device)
+                context_hashes = torch.zeros(rows, dtype=torch.int64, device=device)
+                keys = torch.zeros(rows, dtype=torch.int64, device=device)
+                compiled(
+                    probs,
+                    context_hashes,
+                    keys,
+                    self.synthid_depth,
+                    self.synthid_candidate_cap,
+                )
+            if torch.cuda.is_available():
+                torch.cuda.synchronize(device)
+        except Exception:
+            logger.warning(
+                "synthid_compile: torch.compile warm-up failed; "
+                "falling back to eager reweight",
+                exc_info=True,
+            )
+            return _synthid_reweight_probs
+        logger.info("synthid_compile: using torch.compile'd reweight")
+        return compiled
+
+    def _force_synthid(
+        self,
+        *,
+        logits: torch.Tensor,
+        context_hashes: torch.Tensor,
+        eligible: torch.Tensor,
+        sampling_info: SamplingBatchInfo,
+        keys: torch.Tensor,
+    ) -> torch.Tensor:
+        try:
+            return force_synthid_tokens(
+                logits=logits,
+                context_hashes=context_hashes,
+                eligible=eligible,
+                temperatures=sampling_info.temperatures,
+                top_ks=sampling_info.top_ks,
+                top_ps=sampling_info.top_ps,
+                min_ps=sampling_info.min_ps,
+                keys=keys,
+                depth=self.synthid_depth,
+                candidate_cap=self.synthid_candidate_cap,
+                max_probability=self.max_probability,
+                reweight_fn=self._reweight_fn,
+            )
+        except Exception:
+            if self._reweight_fn is _synthid_reweight_probs:
+                raise
+            # force_synthid_tokens mutates logits only after the reweight
+            # succeeds, so an eager retry starts from intact logits.
+            logger.warning(
+                "synthid_compile: compiled reweight failed at runtime; "
+                "falling back to eager",
+                exc_info=True,
+            )
+            self._reweight_fn = _synthid_reweight_probs
+            return self._force_synthid(
+                logits=logits,
+                context_hashes=context_hashes,
+                eligible=eligible,
+                sampling_info=sampling_info,
+                keys=keys,
+            )
+
     def force(
         self,
         logits: torch.Tensor,
@@ -1369,18 +1466,12 @@ class WatermarkState:
                 & (sampling_info.top_ks <= 1).logical_not()
                 & (context_lengths > 0),
             )
-            selected = force_synthid_tokens(
+            selected = self._force_synthid(
                 logits=logits,
                 context_hashes=context_hashes,
                 eligible=eligible,
-                temperatures=sampling_info.temperatures,
-                top_ks=sampling_info.top_ks,
-                top_ps=sampling_info.top_ps,
-                min_ps=sampling_info.min_ps,
+                sampling_info=sampling_info,
                 keys=keys,
-                depth=self.synthid_depth,
-                candidate_cap=self.synthid_candidate_cap,
-                max_probability=self.max_probability,
             )
             self._record_contexts(req_pool_indices, context_hashes, selected)
             return

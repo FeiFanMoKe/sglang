@@ -258,3 +258,35 @@ def test_binomial_normal_approximation_continuous_at_cutoff():
         (count - 0.5 - trials / 2) / math.sqrt(trials / 4)
     )
     assert math.exp(approx) == pytest.approx(math.exp(exact), rel=0.01)
+
+
+def test_config_synthid_compile_flag():
+    config = load_watermark_config(
+        '{"key": "2a", "algorithm": "synthid", "synthid_compile": true}'
+    )
+    assert config.synthid_compile is True
+    with pytest.raises(WatermarkConfigError):
+        load_watermark_config('{"key": "2a", "synthid_compile": "yes"}')
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="compile path uses CUDA")
+def test_compiled_reweight_allclose_and_deterministic():
+    """The compiled reweight may reorder fp32 reductions (not bit-exact),
+    but must stay close to eager and deterministic per (key, context)."""
+    from sglang.srt.sampling.watermarking.core import (
+        _get_compiled_synthid_reweight,
+        _synthid_reweight_probs,
+    )
+
+    probs = _random_probs(4, seed=21).cuda()
+    context_hashes = _hash_contexts(
+        torch.randint(0, VOCAB_SIZE, (4, CONTEXT_WINDOW)),
+        torch.full((4,), CONTEXT_WINDOW),
+    ).cuda()
+    keys = torch.full((4,), KEY_INT, dtype=torch.int64, device="cuda")
+    compiled = _get_compiled_synthid_reweight()
+    expected = _synthid_reweight_probs(probs, context_hashes, keys, DEPTH, 256)
+    actual = compiled(probs, context_hashes, keys, DEPTH, 256)
+    assert torch.allclose(expected, actual, rtol=1e-5, atol=1e-7)
+    rerun = compiled(probs, context_hashes, keys, DEPTH, 256)
+    assert torch.equal(actual, rerun)
