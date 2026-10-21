@@ -8,7 +8,9 @@ import msgspec
 import torch
 
 from .config import (
+    MAX_SYNTHID_DEPTH,
     MAX_WATERMARKED_CONTEXTS_PER_REQUEST,
+    WATERMARK_ALGORITHMS,
     WatermarkServerConfig,
     parse_watermark_key,
 )
@@ -351,6 +353,49 @@ def _dual_key_a_mask_torch(
     return hashed < mixing_thresholds
 
 
+def _watermark_hash32_layer_torch(
+    keys: torch.Tensor,
+    context_hashes: torch.Tensor,
+    token_ids: torch.Tensor,
+    layer: int,
+) -> torch.Tensor:
+    """Keyed hash for one SynthID g-value layer (5 words, domain ^ 20).
+
+    token_ids may be 1-D (shared candidates, broadcast over rows) or 2-D
+    (rows, C) per-row candidate sets.
+    """
+    token_matrix = token_ids.view(1, -1) if token_ids.dim() == 1 else token_ids
+    state = torch.zeros(
+        (keys.shape[0], token_matrix.shape[1]),
+        dtype=torch.int64,
+        device=keys.device,
+    )
+    keys = keys.view(-1, 1)
+    state = _murmur3_mix(state, keys & _MASK32)
+    state = _murmur3_mix(state, (keys >> 32) & _MASK32)
+    state = _murmur3_mix(state, context_hashes.view(-1, 1) & _MASK32)
+    state = _murmur3_mix(state, token_matrix & _MASK32)
+    state = _murmur3_mix(state, torch.full_like(state, layer + 1))
+    return _fmix32(state ^ 20)
+
+
+def _watermark_sample_uniform_torch(
+    keys: torch.Tensor, context_hashes: torch.Tensor
+) -> torch.Tensor:
+    """Per-row uniform in (0, 1) for sampling the reweighted distribution.
+
+    A 3-word message (domain ^ 12) keeps the draw independent of every
+    g-value layer (5 words, domain ^ 20) and of the Gumbel hash (4 words,
+    domain ^ 16), per the 4 * num_words domain convention.
+    """
+    state = torch.zeros(keys.shape[0], dtype=torch.int64, device=keys.device)
+    state = _murmur3_mix(state, keys & _MASK32)
+    state = _murmur3_mix(state, (keys >> 32) & _MASK32)
+    state = _murmur3_mix(state, context_hashes & _MASK32)
+    hashed = _fmix32(state ^ 12)
+    return ((hashed.to(torch.float64) + 0.5) / _UINT32_SCALE).to(torch.float32)
+
+
 def _log_uniform_from_hash_torch(hashed: torch.Tensor) -> torch.Tensor:
     lower = torch.log((hashed.to(torch.float32) + 0.5) / _UINT32_SCALE)
     complement = (_MASK32 - hashed).to(torch.float32) + 0.5
@@ -383,6 +428,120 @@ def select_watermark_tokens_torch(
         -torch.inf,
     )
     return scores.argmax(dim=-1)
+
+
+def force_synthid_tokens(
+    logits: torch.Tensor,
+    context_hashes: torch.Tensor,
+    eligible: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    min_ps: torch.Tensor,
+    keys: torch.Tensor,
+    depth: int,
+    candidate_cap: int | None = None,
+    max_probability: float = 1.0,
+) -> torch.Tensor:
+    rows = eligible.nonzero(as_tuple=True)[0]
+    if rows.numel() == 0:
+        return eligible
+    probabilities = _truncate_probabilities(
+        logits[rows],
+        temperatures[rows],
+        top_ks[rows],
+        top_ps[rows],
+        min_ps[rows],
+    )
+    keep = probabilities.amax(dim=-1) <= max_probability
+    rows = rows[keep]
+    selected_mask = torch.zeros_like(eligible)
+    if rows.numel() == 0:
+        return selected_mask
+    selected_mask[rows] = True
+    selected = select_synthid_tokens_torch(
+        probabilities[keep].to(torch.float32),
+        context_hashes[rows],
+        keys[rows],
+        depth,
+        candidate_cap=candidate_cap,
+    )
+    logits[rows] = -torch.inf
+    logits[rows, selected] = 0.0
+    return selected_mask
+
+
+def _synthid_reweight_probs(
+    probabilities: torch.Tensor,
+    context_hashes: torch.Tensor,
+    keys: torch.Tensor,
+    depth: int,
+    candidate_cap: int | None = None,
+) -> torch.Tensor:
+    """Per-layer expected-g-value update, ``probs *= (1 + g - E[g])``.
+
+    With `candidate_cap`, layers score only the top-cap candidates per row;
+    the tail is treated as neutral (g = E[g] = 0.5) and its mass is tracked
+    per layer so the update stays mass-conserving. Exact whenever the post
+    top-k/top-p support fits under the cap.
+    """
+    vocab_size = probabilities.shape[-1]
+    if candidate_cap is None or candidate_cap >= vocab_size:
+        candidate_ids = None
+        probs = probabilities
+        tail_mass = None
+    else:
+        probs, candidate_ids = probabilities.topk(candidate_cap, dim=-1)
+        initial_tail_mass = 1 - probs.sum(dim=-1, keepdim=True)
+        tail_mass = initial_tail_mass
+    token_ids = (
+        torch.arange(vocab_size, device=probabilities.device)
+        if candidate_ids is None
+        else candidate_ids
+    )
+    for layer in range(depth):
+        hashed = _watermark_hash32_layer_torch(keys, context_hashes, token_ids, layer)
+        g = (hashed >= (1 << 31)).to(probs.dtype)
+        g_mass = (g * probs).sum(dim=-1, keepdim=True)
+        if tail_mass is not None:
+            g_mass = g_mass + 0.5 * tail_mass
+        probs = probs * (1.0 + g - g_mass)
+        if tail_mass is not None:
+            tail_mass = tail_mass * (1.5 - g_mass)
+    if tail_mass is None:
+        return probs
+    tail_scale = torch.where(
+        initial_tail_mass > 0,
+        tail_mass / initial_tail_mass.clamp_min(torch.finfo(torch.float32).tiny),
+        torch.ones_like(tail_mass),
+    )
+    return (probabilities * tail_scale).scatter(-1, candidate_ids, probs)
+
+
+def select_synthid_tokens_torch(
+    probabilities: torch.Tensor,
+    context_hashes: torch.Tensor,
+    keys: torch.Tensor,
+    depth: int,
+    candidate_cap: int | None = None,
+) -> torch.Tensor:
+    """Non-distortionary SynthID-Text selection.
+
+    Reweights the distribution per layer (see `_synthid_reweight_probs`),
+    then draws with a keyed inverse-CDF step: deterministic per
+    (key, context), no global RNG consumption.
+    """
+    probs = _synthid_reweight_probs(
+        probabilities, context_hashes, keys, depth, candidate_cap
+    )
+    uniforms = _watermark_sample_uniform_torch(keys, context_hashes)
+    cumulative = probs.cumsum(dim=-1)
+    targets = uniforms.to(probs.dtype).unsqueeze(-1) * cumulative[:, -1:]
+    return (
+        torch.searchsorted(cumulative, targets, right=True)
+        .squeeze(-1)
+        .clamp_max(probabilities.shape[-1] - 1)
+    )
 
 
 def _truncate_probabilities(
@@ -481,7 +640,23 @@ class WatermarkState:
         max_probability: float = 1.0,
         default_enabled: bool = False,
         enforce_all: bool = False,
+        algorithm: str = "gumbel",
+        synthid_depth: int = 30,
+        synthid_candidate_cap: int | None = 4096,
     ) -> None:
+        if algorithm not in WATERMARK_ALGORITHMS:
+            raise ValueError(
+                f"watermark algorithm must be one of {WATERMARK_ALGORITHMS}"
+            )
+        if not 1 <= synthid_depth <= MAX_SYNTHID_DEPTH:
+            raise ValueError(
+                f"synthid depth must be an integer from 1 to {MAX_SYNTHID_DEPTH}"
+            )
+        if synthid_candidate_cap is not None and synthid_candidate_cap < 1:
+            raise ValueError("synthid candidate cap must be a positive integer")
+        self.algorithm = algorithm
+        self.synthid_depth = synthid_depth
+        self.synthid_candidate_cap = synthid_candidate_cap
         self.default_key_source = key
         self.default_key = parse_watermark_key(key) if key is not None else None
         self.default_key_b = parse_watermark_key(key_b) if key_b is not None else None
@@ -919,6 +1094,18 @@ class WatermarkState:
         sampling_info: SamplingBatchInfo,
         draft_token_num: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.algorithm == "synthid":
+            # SynthID reweights the distribution instead of forcing a
+            # hash-selected token, so it cannot reuse the dual-key Gumbel
+            # verify protocol. The implementation belongs here: reweight each
+            # of the draft_token_num verify rows with its own context via
+            # _synthid_reweight_probs, then let standard rejection sampling
+            # run against the reweighted target probabilities. Draft-side
+            # sampling needs the same hook in the draft worker, which runs
+            # without a watermark_state today.
+            raise NotImplementedError(
+                "SynthID watermarking does not support speculative decoding yet"
+            )
         context_hashes = _hash_contexts(contexts, context_lengths)
         expanded_req_pool_indices = req_pool_indices.repeat_interleave(draft_token_num)
         keys, _, watermark_enabled = self._watermark_batch_config(sampling_info)
@@ -987,6 +1174,13 @@ class WatermarkState:
             prepare_speculative_watermark_contexts_triton,
         )
 
+        if self.algorithm == "synthid":
+            # See force_speculative for what a SynthID verify-path
+            # implementation must do; the tree path additionally needs
+            # per-node contexts from speculative_contexts.
+            raise NotImplementedError(
+                "SynthID watermarking does not support speculative decoding yet"
+            )
         if not can_use_finite_topk_watermark(sampling_info.max_top_k, logits.shape[1]):
             contexts, context_lengths = self.speculative_contexts(
                 req_pool_indices=req_pool_indices,
@@ -1124,10 +1318,37 @@ class WatermarkState:
         max_top_k = sampling_info.max_top_k
         if max_top_k == 1:
             return
+        keys_b, mixing_thresholds = self._dual_key_rows(req_pool_indices)
+        if self.algorithm == "synthid":
+            contexts, context_lengths = self.contexts_tail(
+                req_pool_indices, context_windows
+            )
+            context_hashes = _hash_contexts(contexts, context_lengths)
+            eligible = self._new_context_mask(
+                req_pool_indices,
+                context_hashes,
+                watermark_enabled
+                & (sampling_info.top_ks <= 1).logical_not()
+                & (context_lengths > 0),
+            )
+            selected = force_synthid_tokens(
+                logits=logits,
+                context_hashes=context_hashes,
+                eligible=eligible,
+                temperatures=sampling_info.temperatures,
+                top_ks=sampling_info.top_ks,
+                top_ps=sampling_info.top_ps,
+                min_ps=sampling_info.min_ps,
+                keys=keys,
+                depth=self.synthid_depth,
+                candidate_cap=self.synthid_candidate_cap,
+                max_probability=self.max_probability,
+            )
+            self._record_contexts(req_pool_indices, context_hashes, selected)
+            return
         partial_scores, partial_token_ids, output_token_ids = (
             self._ensure_selection_buffers(logits.shape[0], logits.shape[1])
         )
-        keys_b, mixing_thresholds = self._dual_key_rows(req_pool_indices)
         if logits.is_cuda:
             from sglang.kernels.ops.sampling.textseal_selector import (
                 can_use_finite_topk_watermark,

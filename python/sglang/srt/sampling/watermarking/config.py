@@ -14,6 +14,8 @@ logger = logging.getLogger(__name__)
 _MAX_CONFIG_BYTES = 4096
 MAX_WATERMARK_CONTEXT_WINDOW = 64
 MAX_WATERMARKED_CONTEXTS_PER_REQUEST = 4096
+MAX_SYNTHID_DEPTH = 64
+WATERMARK_ALGORITHMS = ("gumbel", "synthid")
 
 
 class WatermarkConfigError(ValueError):
@@ -29,6 +31,9 @@ class WatermarkServerConfig(msgspec.Struct, frozen=True, kw_only=True):
     max_probability: float | None = None
     default_enabled: bool | None = None
     enforce_all: bool | None = None
+    algorithm: str | None = None
+    synthid_depth: int | None = None
+    synthid_candidate_cap: int | None = None
 
     def __repr__(self) -> str:
         return (
@@ -37,7 +42,10 @@ class WatermarkServerConfig(msgspec.Struct, frozen=True, kw_only=True):
             f"mixing_probability={self.mixing_probability!r}, "
             f"max_probability={self.max_probability!r}, "
             f"default_enabled={self.default_enabled!r}, "
-            f"enforce_all={self.enforce_all!r})"
+            f"enforce_all={self.enforce_all!r}, "
+            f"algorithm={self.algorithm!r}, "
+            f"synthid_depth={self.synthid_depth!r}, "
+            f"synthid_candidate_cap={self.synthid_candidate_cap!r})"
         )
 
 
@@ -114,4 +122,35 @@ def load_watermark_config(source: str) -> WatermarkServerConfig:
     for name in ("default_enabled", "enforce_all"):
         if raw.get(name) is not None and not isinstance(raw[name], bool):
             raise WatermarkConfigError(f"watermark config {name} must be a boolean")
+    algorithm = raw.get("algorithm")
+    if algorithm is not None and algorithm not in WATERMARK_ALGORITHMS:
+        raise WatermarkConfigError(
+            f"watermark config algorithm must be one of {WATERMARK_ALGORITHMS}"
+        )
+    synthid_depth = raw.get("synthid_depth")
+    if synthid_depth is not None and (
+        isinstance(synthid_depth, bool)
+        or not isinstance(synthid_depth, int)
+        or not 1 <= synthid_depth <= MAX_SYNTHID_DEPTH
+    ):
+        raise WatermarkConfigError(
+            f"watermark config synthid_depth must be an integer from 1 to "
+            f"{MAX_SYNTHID_DEPTH}"
+        )
+    synthid_candidate_cap = raw.get("synthid_candidate_cap")
+    if synthid_candidate_cap is not None and (
+        isinstance(synthid_candidate_cap, bool)
+        or not isinstance(synthid_candidate_cap, int)
+        or synthid_candidate_cap < 1
+    ):
+        raise WatermarkConfigError(
+            "watermark config synthid_candidate_cap must be a positive integer"
+        )
+    if algorithm == "synthid":
+        for name in ("key_b", "mixing_probability"):
+            if raw.get(name) is not None:
+                raise WatermarkConfigError(
+                    f"watermark config {name} is not supported with "
+                    "algorithm='synthid'"
+                )
     return WatermarkServerConfig(**raw)

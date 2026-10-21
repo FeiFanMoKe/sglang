@@ -107,6 +107,18 @@ class ExecFeatures(msgspec.Struct):
         bool,
         Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
     ] = False
+    watermark_algorithm: A[
+        str,
+        Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
+    ] = "gumbel"
+    watermark_synthid_depth: A[
+        int,
+        Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
+    ] = 30
+    watermark_synthid_candidate_cap: A[
+        Optional[int],
+        Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
+    ] = 4096
     enable_return_hidden_states: A[
         bool,
         "Enable returning full hidden states with responses. Equivalent to "

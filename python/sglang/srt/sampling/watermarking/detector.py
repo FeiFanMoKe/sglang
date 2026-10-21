@@ -14,6 +14,9 @@ from .config import (
 
 _MASK32 = 0xFFFFFFFF
 _UINT32_SCALE = 1 << 32
+# Past this many coin flips the exact survival sum is O(trials) Python work;
+# the continuity-corrected normal approximation is already tight there.
+_EXACT_BINOMIAL_MAX_TRIALS = 100_000
 
 
 def _rotl32(value: int, shift: int) -> int:
@@ -44,6 +47,15 @@ def watermark_hash(key: int, context_hash: int, token_id: int) -> int:
     )
 
 
+def watermark_hash_layer(
+    key: int, context_hash: int, token_id: int, layer: int
+) -> int:
+    """Keyed hash for one SynthID g-value layer (5 words, domain ^ 20)."""
+    return _murmur3_words(
+        (key & _MASK32, (key >> 32) & _MASK32, context_hash, token_id, layer + 1)
+    )
+
+
 def position_coin(key_a: int, key_b: int, context_hash: int) -> int:
     return _murmur3_words(
         (
@@ -64,6 +76,109 @@ def _gamma_log_survival(score: float, shape: int) -> float:
     peak = max(terms)
     tail = -score + peak + math.log(math.fsum(math.exp(t - peak) for t in terms))
     return min(0.0, tail)
+
+
+def _binomial_log_survival(count: int, trials: int) -> float:
+    """Log of P(X >= count) for X ~ Binomial(trials, 0.5), in log space."""
+    if count <= 0:
+        return 0.0
+    log_2_pow_n = trials * math.log(2)
+
+    def log_pmf(i: int) -> float:
+        return (
+            math.lgamma(trials + 1)
+            - math.lgamma(i + 1)
+            - math.lgamma(trials - i + 1)
+            - log_2_pow_n
+        )
+
+    log_terms = [log_pmf(count)]
+    for i in range(count + 1, trials + 1):
+        log_terms.append(log_terms[-1] + math.log(trials - i + 1) - math.log(i))
+    peak = max(log_terms)
+    return min(0.0, peak + math.log(math.fsum(math.exp(t - peak) for t in log_terms)))
+
+
+def _normal_log_survival(z: float) -> float:
+    """Log of P(X >= z) for standard normal X; asymptotic past erfc's range."""
+    if z < 38:
+        return math.log(0.5 * math.erfc(z / math.sqrt(2)))
+    return -z * z / 2 - math.log(z * math.sqrt(2 * math.pi))
+
+
+def watermark_sample_uniform(key: int, context_hash: int) -> float:
+    """Scalar counterpart of the generation-side sampling draw (domain ^ 12)."""
+    hashed = _murmur3_words((key & _MASK32, (key >> 32) & _MASK32, context_hash))
+    return (hashed + 0.5) / _UINT32_SCALE
+
+
+class SynthIDWatermarkDetection(msgspec.Struct, frozen=True, kw_only=True):
+    num_scored_tokens: int
+    g_value_count: int
+    z_score: float
+    p_value: float
+    log_p_value: float
+    repeated_contexts: int
+
+
+def detect_synthid(
+    token_ids: Iterable[int],
+    *,
+    key: str,
+    depth: int = 30,
+    prompt_token_ids: Iterable[int] = (),
+    context_window: int = 4,
+) -> SynthIDWatermarkDetection:
+    """Mean g-value SynthID-Text detection with a binomial null.
+
+    Under the null hypothesis each scored token receives independent fair
+    coin flips across all layers, so the g-value count follows a
+    Binomial(num_scored_tokens * depth, 0.5) distribution.
+    """
+    parsed_key = parse_watermark_key(key)
+    prompt = _validate_token_ids(prompt_token_ids)
+    completion = _validate_token_ids(token_ids)
+    context_window = _validate_int_range(
+        "context_window", context_window, MAX_WATERMARK_CONTEXT_WINDOW
+    )
+    tokens = prompt[-context_window:] + completion
+    start = min(len(prompt), context_window)
+    first = start if prompt else min(context_window, len(completion))
+
+    seen = set()
+    repeated = 0
+    g_count = 0
+    scored = 0
+    for position in range(first, len(tokens)):
+        context = tuple(tokens[max(0, position - context_window) : position])
+        if context in seen:
+            repeated += 1
+            continue
+        seen.add(context)
+        context_hash = hash_context(context)
+        token = tokens[position]
+        for layer in range(depth):
+            hashed = watermark_hash_layer(parsed_key, context_hash, token, layer)
+            g_count += hashed >= (1 << 31)
+        scored += 1
+
+    trials = scored * depth
+    if not trials:
+        log_p, z = 0.0, 0.0
+    elif trials <= _EXACT_BINOMIAL_MAX_TRIALS:
+        log_p = _binomial_log_survival(g_count, trials)
+        z = (g_count - trials / 2) / math.sqrt(trials / 4)
+    else:
+        z = (g_count - trials / 2) / math.sqrt(trials / 4)
+        log_p = _normal_log_survival((g_count - 0.5 - trials / 2) / math.sqrt(trials / 4))
+    return SynthIDWatermarkDetection(
+        num_scored_tokens=scored,
+        g_value_count=g_count,
+        z_score=z,
+        p_value=math.exp(log_p),
+        log_p_value=log_p,
+        repeated_contexts=repeated,
+    )
 
 
 class WatermarkStatistics(msgspec.Struct, frozen=True):
