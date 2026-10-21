@@ -382,23 +382,6 @@ def _watermark_hash32_layer_torch(
     return _fmix32(state ^ 20)
 
 
-def _watermark_sample_uniform_torch(
-    keys: torch.Tensor, context_hashes: torch.Tensor
-) -> torch.Tensor:
-    """Per-row uniform in (0, 1) for sampling the reweighted distribution.
-
-    A 3-word message (domain ^ 12) keeps the draw independent of every
-    g-value layer (5 words, domain ^ 20) and of the Gumbel hash (4 words,
-    domain ^ 16), per the 4 * num_words domain convention.
-    """
-    state = torch.zeros(keys.shape[0], dtype=torch.int64, device=keys.device)
-    state = _murmur3_mix(state, keys & _MASK32)
-    state = _murmur3_mix(state, (keys >> 32) & _MASK32)
-    state = _murmur3_mix(state, context_hashes & _MASK32)
-    hashed = _fmix32(state ^ 12)
-    return ((hashed.to(torch.float64) + 0.5) / _UINT32_SCALE).to(torch.float32)
-
-
 def _log_uniform_from_hash_torch(hashed: torch.Tensor) -> torch.Tensor:
     lower = torch.log((hashed.to(torch.float32) + 0.5) / _UINT32_SCALE)
     complement = (_MASK32 - hashed).to(torch.float32) + 0.5
@@ -585,15 +568,15 @@ def select_synthid_tokens_torch(
     """Non-distortionary SynthID-Text selection.
 
     Reweights the distribution per layer (see `_synthid_reweight_probs`),
-    then draws with a keyed inverse-CDF step: deterministic per
-    (key, context), no global RNG consumption.
+    then samples from it by inverse CDF with fresh randomness: the key
+    only tilts the distribution, the draw itself is stochastic.
     """
     probs = (reweight_fn or _synthid_reweight_probs)(
         probabilities, context_hashes, keys, depth, candidate_cap
     )
-    uniforms = _watermark_sample_uniform_torch(keys, context_hashes)
+    uniforms = torch.rand(keys.shape[0], dtype=probs.dtype, device=probs.device)
     cumulative = probs.cumsum(dim=-1)
-    targets = uniforms.to(probs.dtype).unsqueeze(-1) * cumulative[:, -1:]
+    targets = uniforms.unsqueeze(-1) * cumulative[:, -1:]
     return (
         torch.searchsorted(cumulative, targets, right=True)
         .squeeze(-1)

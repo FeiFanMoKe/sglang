@@ -18,7 +18,6 @@ from sglang.srt.sampling.watermarking.core import (
     _synthid_reweight_probs,
     _truncate_probabilities,
     _watermark_hash32_layer_torch,
-    _watermark_sample_uniform_torch,
     force_synthid_tokens,
     select_synthid_tokens_torch,
 )
@@ -29,7 +28,6 @@ from sglang.srt.sampling.watermarking.detector import (
     detect_synthid,
     hash_context,
     watermark_hash_layer,
-    watermark_sample_uniform,
 )
 
 KEY = "2a"
@@ -180,32 +178,42 @@ def test_config_validation():
     assert config.synthid_candidate_cap == 1024
 
 
-def test_sampling_is_deterministic_and_ignores_global_rng():
-    """The keyed inverse-CDF draw must reproduce regardless of global RNG state."""
+def test_reweight_deterministic_and_draw_stochastic():
+    """The reweighted distribution is fixed per (key, context) and ignores
+    global RNG state; the inverse-CDF draw samples it with fresh randomness,
+    so the same seed must reproduce a draw and different seeds should vary."""
     probs = _random_probs(4, seed=11)
     context_hashes = _hash_contexts(
         torch.randint(0, VOCAB_SIZE, (4, CONTEXT_WINDOW)),
         torch.full((4,), CONTEXT_WINDOW),
     )
     keys = torch.full((4,), KEY_INT, dtype=torch.int64)
-    first = select_synthid_tokens_torch(probs, context_hashes, keys, DEPTH)
+    expected = _synthid_reweight_probs(probs, context_hashes, keys, DEPTH)
     torch.randint(0, 2**31, (1000,))  # perturb the global RNG
-    second = select_synthid_tokens_torch(probs, context_hashes, keys, DEPTH)
-    assert torch.equal(first, second)
+    assert torch.equal(expected, _synthid_reweight_probs(probs, context_hashes, keys, DEPTH))
+    torch.manual_seed(0)
+    first = select_synthid_tokens_torch(probs, context_hashes, keys, DEPTH)
+    torch.manual_seed(0)
+    assert torch.equal(first, select_synthid_tokens_torch(probs, context_hashes, keys, DEPTH))
 
 
-def test_sample_uniform_torch_matches_scalar():
-    """The sampling draw's hash contract (3 words, domain ^ 12) must match
-    the scalar reference, like the g-value layers do."""
-    contexts = torch.randint(0, VOCAB_SIZE, (3, CONTEXT_WINDOW))
-    context_hashes = _hash_contexts(contexts, torch.full((3,), CONTEXT_WINDOW))
-    keys = torch.tensor([KEY_INT, 0, -(2**63)], dtype=torch.int64)
-    uniforms = _watermark_sample_uniform_torch(keys, context_hashes)
-    for row in range(3):
-        context = tuple(int(t) for t in contexts[row])
-        expected = watermark_sample_uniform(int(keys[row]), hash_context(context))
-        assert uniforms[row].item() == pytest.approx(expected, abs=1e-6)
-    assert ((uniforms > 0) & (uniforms < 1)).all()
+def test_sampling_marginal_matches_base_distribution():
+    """Over the key ensemble the sampled token follows the original
+    distribution: reweighting tilts per key, sampling stays non-distortionary."""
+    base = torch.tensor([0.5, 0.3, 0.15, 0.05])
+    probs = base.unsqueeze(0)
+    counts = torch.zeros(4)
+    trials = 4000
+    generator = torch.Generator().manual_seed(17)
+    torch.manual_seed(19)
+    for _ in range(trials):
+        key = int(torch.randint(0, 2**31, (1,), generator=generator))
+        context_hash = torch.randint(0, 2**32, (1,), generator=generator)
+        selected = select_synthid_tokens_torch(
+            probs, context_hash, torch.tensor([key]), DEPTH
+        )
+        counts[selected.item()] += 1
+    assert torch.allclose(counts / trials, base, atol=0.03)
 
 
 def test_candidate_cap_exact_when_support_fits_cap():

@@ -106,12 +106,6 @@ def _normal_log_survival(z: float) -> float:
     return -z * z / 2 - math.log(z * math.sqrt(2 * math.pi))
 
 
-def watermark_sample_uniform(key: int, context_hash: int) -> float:
-    """Scalar counterpart of the generation-side sampling draw (domain ^ 12)."""
-    hashed = _murmur3_words((key & _MASK32, (key >> 32) & _MASK32, context_hash))
-    return (hashed + 0.5) / _UINT32_SCALE
-
-
 class SynthIDWatermarkDetection(msgspec.Struct, frozen=True, kw_only=True):
     num_scored_tokens: int
     g_value_count: int
